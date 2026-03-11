@@ -203,11 +203,23 @@ const ESPN_TEAM_IDS = {
 // Rosters fetched today are always considered stale at app startup for playing teams.
 // Non-playing teams use a 6-hour TTL.
 const ROSTER_TTL_MS    = 6 * 60 * 60 * 1000;
-const ROSTER_CACHE_KEY = "ftb-rosters-v2";
+const ROSTER_CACHE_KEY = "ftb-rosters-v3";
 
 // Minimum expected roster size. ESPN returns 15-20 active + 2-way + two-ways.
 // If a cached entry has fewer than this, it's considered corrupt/incomplete.
 const MIN_ROSTER_SIZE = 8;
+
+const BALLDONTLIE_TEAM_IDS = {
+  ATL:1, BOS:2, BKN:3, CHA:4, CHI:5, CLE:6, DAL:7, DEN:8, DET:9, GSW:10,
+  HOU:11, IND:12, LAC:13, LAL:14, MEM:15, MIA:16, MIL:17, MIN:18, NOP:19, NYK:20,
+  OKC:21, ORL:22, PHI:23, PHX:24, POR:25, SAC:26, SAS:27, TOR:28, UTA:29, WAS:30,
+};
+
+const BREF_TEAM_CODES = {
+  ATL:"ATL", BOS:"BOS", BKN:"BRK", CHA:"CHO", CHI:"CHI", CLE:"CLE", DAL:"DAL", DEN:"DEN", DET:"DET", GSW:"GSW",
+  HOU:"HOU", IND:"IND", LAC:"LAC", LAL:"LAL", MEM:"MEM", MIA:"MIA", MIL:"MIL", MIN:"MIN", NOP:"NOP", NYK:"NYK",
+  OKC:"OKC", ORL:"ORL", PHI:"PHI", PHX:"PHO", POR:"POR", SAC:"SAC", SAS:"SAS", TOR:"TOR", UTA:"UTA", WAS:"WAS",
+};
 
 // ─── ROSTER FRESHNESS VALIDATION ──────────────────────────────────────────────
 /**
@@ -259,6 +271,54 @@ function saveTeamToCache(teamAbbr, players) {
   } catch(e) {
     console.warn(`[RosterSync] Failed to cache ${teamAbbr}:`, e.message);
   }
+}
+
+function normalizeHeightWeight(height, weight) {
+  let hw = "";
+  if (height) hw += String(height).trim();
+  if (weight) hw += `${hw ? " / " : ""}${String(weight).trim()}`;
+  return hw;
+}
+
+function normalizeStarterFlag(rawStarter, rawStatus) {
+  if (typeof rawStarter === "boolean") return rawStarter;
+  const s = String(rawStarter || "").toLowerCase();
+  const status = String(rawStatus || "").toLowerCase();
+  if (["starter", "starting"].includes(s) || status.includes("starter")) return true;
+  if (["bench", "reserve"].includes(s) || status.includes("bench")) return false;
+  return null;
+}
+
+function normalizeRosterPlayer({
+  name,
+  team,
+  pos,
+  ppg = 0,
+  usageRate = 0,
+  gp = 0,
+  ftbPct = 0,
+  espnId = "",
+  isStarter = null,
+  heightWeight = "",
+  activeStatus = "ACTIVE",
+  source = "unknown",
+}) {
+  return {
+    name,
+    team,
+    opp: "",
+    gameTime: "",
+    pos: normalizePosition(pos),
+    ppg: parseFloat((ppg || 0).toFixed ? ppg.toFixed(1) : Number(ppg || 0).toFixed(1)),
+    usageRate: parseFloat((usageRate || 0).toFixed ? usageRate.toFixed(1) : Number(usageRate || 0).toFixed(1)),
+    gp: Math.max(0, Math.round(Number(gp) || 0)),
+    ftbPct: Math.max(0, Math.round(Number(ftbPct) || 0)),
+    espnId: String(espnId || ""),
+    isStarter,
+    heightWeight,
+    activeStatus,
+    rosterSource: source,
+  };
 }
 
 // ─── MERGE ESPN ROSTER WITH KNOWN FTB DATA ─────────────────────────────────────
@@ -382,9 +442,9 @@ function useRosters(liveGames) {
 
       const batchResults = await Promise.allSettled(
         batch.map(async (team) => {
-          log(`  Fetching new roster from API for ${TEAM_NAMES[team] || team} (${team})...`, "info");
+          log(`  Fetching new roster from multi-source pipeline for ${TEAM_NAMES[team] || team} (${team})...`, "info");
           try {
-            const fetched = await fetchESPNRoster(team);
+            const fetched = await fetchRosterWithFallback(team, log);
             const merged  = mergeWithFtbData(fetched);
 
             if (merged.length < MIN_ROSTER_SIZE) {
@@ -519,8 +579,7 @@ function normalizePosition(raw) {
 // ─── ESPN ROSTER FETCHER ───────────────────────────────────────────────────────
 /**
  * Fetches the current roster for `teamAbbr` from ESPN.
- * Returns an array of player objects matching the internal schema:
- * { name, team, pos, ppg, usageRate, gp, ftbPct, espnId, isStarter }
+ * Returns normalized player objects matching the internal schema.
  */
 async function fetchESPNRoster(teamAbbr) {
   const teamId = ESPN_TEAM_IDS[teamAbbr];
@@ -534,7 +593,6 @@ async function fetchESPNRoster(teamAbbr) {
   const athletes = data?.athletes || [];
   const players = [];
 
-  // ESPN returns athletes grouped by position category
   for (const group of athletes) {
     const items = group?.items || group?.athletes || (Array.isArray(group) ? group : []);
     for (const athlete of items) {
@@ -544,9 +602,8 @@ async function fetchESPNRoster(teamAbbr) {
       const rawPos = athlete?.position?.abbreviation || athlete?.position?.displayName || "";
       const pos = normalizePosition(rawPos);
 
-      // Pull stats from athlete.statistics if present, else use defaults
       const stats = athlete?.statistics?.splits?.categories || [];
-      let ppg = 0, gp = 0, usageRate = 0, ftbPct = 0;
+      let ppg = 0, gp = 0, usageRate = 0;
 
       for (const cat of stats) {
         for (const stat of cat?.stats || []) {
@@ -558,32 +615,152 @@ async function fetchESPNRoster(teamAbbr) {
         }
       }
 
-      // Estimate ftbPct from usage + position if we don't have real data
       if (usageRate === 0) usageRate = estimateUsageFromRole(athlete, pos);
       if (ppg === 0)       ppg       = estimatePPG(athlete, usageRate);
-      if (gp === 0)        gp        = 40; // safe mid-season default
+      if (gp === 0)        gp        = 40;
 
-      // ftbPct: use known data if available, else derive from usage
       const knownFtb = SEASON_FTB_DATA[name];
-      ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
 
-      players.push({
+      players.push(normalizeRosterPlayer({
         name,
         team: teamAbbr,
-        opp: "",         // filled in at enrichment time
-        gameTime: "",    // filled in at enrichment time
         pos,
-        ppg: parseFloat(ppg.toFixed(1)),
-        usageRate: parseFloat(usageRate.toFixed(1)),
+        ppg,
+        usageRate,
         gp,
         ftbPct,
         espnId: String(athlete?.id || ""),
-        isStarter: athlete?.starter === true,
-      });
+        isStarter: normalizeStarterFlag(athlete?.starter, athlete?.status?.type?.description),
+        heightWeight: normalizeHeightWeight(athlete?.displayHeight, athlete?.displayWeight ? `${athlete.displayWeight} lb` : ""),
+        activeStatus: athlete?.status?.type?.description || "ACTIVE",
+        source: "ESPN",
+      }));
     }
   }
 
   return players;
+}
+
+async function fetchBallDontLieRoster(teamAbbr) {
+  const teamId = BALLDONTLIE_TEAM_IDS[teamAbbr];
+  if (!teamId) throw new Error(`No balldontlie team ID for ${teamAbbr}`);
+
+  const url = `https://www.balldontlie.io/api/v1/players?per_page=100&team_ids[]=${teamId}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`balldontlie roster ${teamAbbr}: HTTP ${res.status}`);
+  const data = await res.json();
+  const rows = data?.data || [];
+
+  return rows
+    .map((player) => {
+      const name = `${player?.first_name || ""} ${player?.last_name || ""}`.trim();
+      if (!name) return null;
+      const pos = normalizePosition(player?.position || "SF");
+      const usageRate = estimateUsageFromRole({}, pos);
+      const ppg = estimatePPG({}, usageRate);
+      const gp = 40;
+      const knownFtb = SEASON_FTB_DATA[name];
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+
+      return normalizeRosterPlayer({
+        name,
+        team: teamAbbr,
+        pos,
+        ppg,
+        usageRate,
+        gp,
+        ftbPct,
+        espnId: String(player?.id || ""),
+        isStarter: null,
+        heightWeight: normalizeHeightWeight(player?.height_feet && player?.height_inches ? `${player.height_feet}'${player.height_inches}"` : "", player?.weight_pounds ? `${player.weight_pounds} lb` : ""),
+        activeStatus: "ACTIVE",
+        source: "balldontlie",
+      });
+    })
+    .filter(Boolean);
+}
+
+async function fetchBasketballReferenceRoster(teamAbbr) {
+  const brefCode = BREF_TEAM_CODES[teamAbbr];
+  if (!brefCode) throw new Error(`No Basketball Reference code for ${teamAbbr}`);
+
+  const year = new Date().getFullYear() + 1;
+  const url = `https://www.basketball-reference.com/teams/${brefCode}/${year}.html`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Basketball Reference roster ${teamAbbr}: HTTP ${res.status}`);
+  const html = await res.text();
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+  const rows = [...doc.querySelectorAll("table#roster tbody tr")];
+
+  return rows
+    .map((row) => {
+      const name = row.querySelector("td[data-stat='player']")?.textContent?.trim();
+      if (!name) return null;
+      const rawPos = row.querySelector("td[data-stat='pos']")?.textContent?.trim() || "SF";
+      const pos = normalizePosition(rawPos);
+      const usageRate = estimateUsageFromRole({}, pos);
+      const ppg = estimatePPG({}, usageRate);
+      const gp = 40;
+      const knownFtb = SEASON_FTB_DATA[name];
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+      const height = row.querySelector("td[data-stat='height']")?.textContent?.trim() || "";
+      const weight = row.querySelector("td[data-stat='weight']")?.textContent?.trim();
+
+      return normalizeRosterPlayer({
+        name,
+        team: teamAbbr,
+        pos,
+        ppg,
+        usageRate,
+        gp,
+        ftbPct,
+        isStarter: null,
+        heightWeight: normalizeHeightWeight(height, weight ? `${weight} lb` : ""),
+        activeStatus: "ACTIVE",
+        source: "BasketballReference",
+      });
+    })
+    .filter(Boolean);
+}
+
+async function fetchRosterWithFallback(teamAbbr, log) {
+  const unavailableSources = [
+    "API-NBA (requires RapidAPI key)",
+    "SportsDataIO (requires API key)",
+    "NBA Stats endpoints (blocked by browser CORS from this app)",
+    "ESPN team pages HTML scrape (blocked by browser CORS from this app)",
+    "JediBets (no public roster endpoint)",
+  ];
+
+  unavailableSources.forEach((name) => {
+    log(`Skipping unavailable roster source: ${name}`, "debug");
+  });
+
+  const sources = [
+    { name: "Primary API (ESPN)", fetcher: fetchESPNRoster },
+    { name: "Alternative API (balldontlie)", fetcher: fetchBallDontLieRoster },
+    { name: "Alternative website (Basketball Reference)", fetcher: fetchBasketballReferenceRoster },
+  ];
+
+  for (const src of sources) {
+    log(`Checking roster source: ${src.name}`, "debug");
+    try {
+      const players = await src.fetcher(teamAbbr);
+      if (!Array.isArray(players) || players.length === 0) {
+        log(`${src.name} returned no roster data`, "warn");
+        continue;
+      }
+      log(`Roster data retrieved successfully from ${src.name} (${players.length} players)`, "success");
+      return players;
+    } catch (e) {
+      log(`${src.name} failed for ${teamAbbr}: ${e.message}`, "warn");
+    }
+  }
+
+  throw new Error(`All roster sources failed for ${teamAbbr}`);
 }
 
 /** Estimate usage rate from ESPN athlete jersey/role hints when stats are missing */

@@ -1,0 +1,36 @@
+export const STATIC_TEAM_ROSTERS = {
+  ATL:[['Trae Young','PG'],['Dyson Daniels','SG'],['Zaccharie Risacher','SF'],['Jalen Johnson','PF'],['Clint Capela','C'],['Onyeka Okongwu','C'],['Bogdan Bogdanovic','SG'],['De\'Andre Hunter','SF'],['Saddiq Bey','SF'],['Kobe Bufkin','PG']],
+  BOS:[['Jrue Holiday','PG'],['Derrick White','SG'],['Jaylen Brown','SF'],['Jayson Tatum','PF'],['Kristaps Porzingis','C'],['Al Horford','C'],['Payton Pritchard','PG'],['Sam Hauser','SF'],['Luke Kornet','C'],['Neemias Queta','C']],
+  BKN:[['Ben Simmons','PG'],['Cam Thomas','SG'],['Mikal Bridges','SF'],['Dorian Finney-Smith','PF'],['Nic Claxton','C'],['Dennis Schroder','PG'],['Cam Johnson','SF'],['Lonnie Walker IV','SG'],['Noah Clowney','PF'],['Day\'Ron Sharpe','C']],
+  CHA:[['LaMelo Ball','PG'],['Tre Mann','SG'],['Brandon Miller','SF'],['Miles Bridges','PF'],['Mark Williams','C'],['Nick Richards','C'],['Grant Williams','PF'],['Vasilije Micic','PG'],['Seth Curry','SG'],['Cody Martin','SF']],
+  CHI:[['Coby White','PG'],['Zach LaVine','SG'],['Ayo Dosunmu','SG'],['Patrick Williams','PF'],['Nikola Vucevic','C'],['Alex Caruso','SG'],['Jevon Carter','PG'],['Torrey Craig','SF'],['Andre Drummond','C'],['Julian Phillips','SF']],
+  CLE:[['Darius Garland','PG'],['Donovan Mitchell','SG'],['Max Strus','SF'],['Evan Mobley','PF'],['Jarrett Allen','C'],['Caris LeVert','SG'],['Isaac Okoro','SF'],['Georges Niang','PF'],['Dean Wade','PF'],['Sam Merrill','SG']],
+  DAL:[['Luka Doncic','PG'],['Kyrie Irving','SG'],['Dante Exum','SG'],['P.J. Washington','PF'],['Dereck Lively II','C'],['Daniel Gafford','C'],['Tim Hardaway Jr.','SG'],['Maxi Kleber','PF'],['Josh Green','SF'],['Jaden Hardy','SG']],
+  DEN:[['Jamal Murray','PG'],['Kentavious Caldwell-Pope','SG'],['Michael Porter Jr.','SF'],['Aaron Gordon','PF'],['Nikola Jokic','C'],['Reggie Jackson','PG'],['Christian Braun','SG'],['Peyton Watson','SF'],['Zeke Nnaji','PF'],['Justin Holiday','SF']],
+  DET:[['Cade Cunningham','PG'],['Jaden Ivey','SG'],['Ausar Thompson','SF'],['Isaiah Stewart','PF'],['Jalen Duren','C'],['Marcus Sasser','PG'],['Alec Burks','SG'],['Simone Fontecchio','SF'],['Isaiah Livers','SF'],['James Wiseman','C']],
+  GSW:[['Stephen Curry','PG'],['Klay Thompson','SG'],['Andrew Wiggins','SF'],['Draymond Green','PF'],['Kevon Looney','C'],['Chris Paul','PG'],['Jonathan Kuminga','PF'],['Brandin Podziemski','SG'],['Moses Moody','SG'],['Trayce Jackson-Davis','C']],
+  HOU:[['Fred VanVleet','PG'],['Jalen Green','SG'],['Dillon Brooks','SF'],['Jabari Smith Jr.','PF'],['Alperen Sengun','C'],['Amen Thompson','PG'],['Cam Whitmore','SF'],['Tari Eason','PF'],['Jeff Green','PF'],['Jock Landale','C']],
+  IND:[['Tyrese Haliburton','PG'],['Andrew Nembhard','SG'],['Bennedict Mathurin','SG'],['Pascal Siakam','PF'],['Myles Turner','C'],['T.J. McConnell','PG'],['Obi Toppin','PF'],['Aaron Nesmith','SF'],['Jarace Walker','PF'],['Isaiah Jackson','C']],
+  LAC:[['James Harden','PG'],['Terance Mann','SG'],['Paul George','SF'],['Kawhi Leonard','PF'],['Ivica Zubac','C'],['Russell Westbrook','PG'],['Norman Powell','SG'],['Amir Coffey','SF'],['P.J. Tucker','PF'],['Mason Plumlee','C']],
+  LAL:[['D\'Angelo Russell','PG'],['Austin Reaves','SG'],['LeBron James','SF'],['Rui Hachimura','PF'],['Anthony Davis','C'],['Gabe Vincent','PG'],['Taurean Prince','SF'],['Jarred Vanderbilt','PF'],['Cam Reddish','SF'],['Jaxson Hayes','C']],
+  MEM:[['Ja Morant','PG'],['Desmond Bane','SG'],['Marcus Smart','SG'],['Jaren Jackson Jr.','PF'],['Brandon Clarke','C'],['Luke Kennard','SG'],['Santi Aldama','PF'],['Ziaire Williams','SF'],['Vince Williams Jr.','SF'],['GG Jackson','PF']],
+  MIA:[['Terry Rozier','PG'],['Tyler Herro','SG'],['Jimmy Butler','SF'],['Nikola Jovic','PF'],['Bam Adebayo','C'],['Duncan Robinson','SG'],['Jaime Jaquez Jr.','SF'],['Haywood Highsmith','SF'],['Kevin Love','PF'],['Thomas Bryant','C']],
+  MIL:[['Damian Lillard','PG'],['Malik Beasley','SG'],['Khris Middleton','SF'],['Giannis Antetokounmpo','PF'],['Brook Lopez','C'],['Bobby Portis','PF'],['Pat Connaughton','SG'],['AJ Green','SG'],['Jae Crowder','PF'],['MarJon Beauchamp','SF']],
+  MIN:[['Mike Conley','PG'],['Anthony Edwards','SG'],['Jaden McDaniels','SF'],['Karl-Anthony Towns','PF'],['Rudy Gobert','C'],['Naz Reid','C'],['Nickeil Alexander-Walker','SG'],['Kyle Anderson','PF'],['Monte Morris','PG'],['Jordan McLaughlin','PG']],
+  NOP:[['CJ McCollum','PG'],['Herbert Jones','SG'],['Brandon Ingram','SF'],['Zion Williamson','PF'],['Jonas Valanciunas','C'],['Jose Alvarado','PG'],['Trey Murphy III','SF'],['Naji Marshall','SF'],['Larry Nance Jr.','C'],['Dyson Daniels','SG']],
+  NYK:[['Jalen Brunson','PG'],['Donte DiVincenzo','SG'],['Josh Hart','SF'],['Julius Randle','PF'],['Mitchell Robinson','C'],['Miles McBride','PG'],['Bojan Bogdanovic','SF'],['OG Anunoby','SF'],['Precious Achiuwa','PF'],['Isaiah Hartenstein','C']],
+  OKC:[['Shai Gilgeous-Alexander','PG'],['Josh Giddey','SG'],['Lu Dort','SF'],['Jalen Williams','PF'],['Chet Holmgren','C'],['Isaiah Joe','SG'],['Aaron Wiggins','SF'],['Cason Wallace','PG'],['Kenrich Williams','PF'],['Jaylin Williams','C']],
+  ORL:[['Jalen Suggs','PG'],['Cole Anthony','PG'],['Franz Wagner','SF'],['Paolo Banchero','PF'],['Wendell Carter Jr.','C'],['Markelle Fultz','PG'],['Gary Harris','SG'],['Jonathan Isaac','PF'],['Moritz Wagner','C'],['Anthony Black','SG']],
+  PHI:[['Tyrese Maxey','PG'],['De\'Anthony Melton','SG'],['Kelly Oubre Jr.','SF'],['Tobias Harris','PF'],['Joel Embiid','C'],['Kyle Lowry','PG'],['Buddy Hield','SG'],['Nicolas Batum','SF'],['Paul Reed','C'],['Mo Bamba','C']],
+  PHX:[['Bradley Beal','PG'],['Devin Booker','SG'],['Grayson Allen','SG'],['Kevin Durant','PF'],['Jusuf Nurkic','C'],['Eric Gordon','SG'],['Royce O\'Neale','SF'],['Nassir Little','SF'],['Drew Eubanks','C'],['Bol Bol','PF']],
+  POR:[['Anfernee Simons','PG'],['Scoot Henderson','PG'],['Shaedon Sharpe','SG'],['Jerami Grant','PF'],['Deandre Ayton','C'],['Malcolm Brogdon','PG'],['Matisse Thybulle','SF'],['Toumani Camara','SF'],['Robert Williams III','C'],['Duop Reath','C']],
+  SAC:[['De\'Aaron Fox','PG'],['Kevin Huerter','SG'],['Keegan Murray','SF'],['Harrison Barnes','PF'],['Domantas Sabonis','C'],['Malik Monk','SG'],['Davion Mitchell','PG'],['Trey Lyles','PF'],['Sasha Vezenkov','SF'],['Alex Len','C']],
+  SAS:[['Tre Jones','PG'],['Devin Vassell','SG'],['Keldon Johnson','SF'],['Jeremy Sochan','PF'],['Victor Wembanyama','C'],['Malaki Branham','SG'],['Zach Collins','C'],['Julian Champagnie','SF'],['Blake Wesley','PG'],['Cedi Osman','SF']],
+  TOR:[['Immanuel Quickley','PG'],['RJ Barrett','SG'],['Scottie Barnes','SF'],['Kelly Olynyk','PF'],['Jakob Poeltl','C'],['Gary Trent Jr.','SG'],['Gradey Dick','SG'],['Chris Boucher','PF'],['Bruce Brown','SG'],['Ochai Agbaji','SG']],
+  UTA:[['Keyonte George','PG'],['Collin Sexton','SG'],['Lauri Markkanen','SF'],['John Collins','PF'],['Walker Kessler','C'],['Jordan Clarkson','SG'],['Kris Dunn','PG'],['Taylor Hendricks','PF'],['Kelly Olynyk','C'],['Brice Sensabaugh','SF']],
+  WAS:[['Tyus Jones','PG'],['Jordan Poole','SG'],['Deni Avdija','SF'],['Kyle Kuzma','PF'],['Marvin Bagley III','C'],['Corey Kispert','SG'],['Bilal Coulibaly','SF'],['Landry Shamet','SG'],['Richaun Holmes','C'],['Delon Wright','PG']],
+};
+
+export function getStaticRoster(teamAbbr) {
+  return (STATIC_TEAM_ROSTERS[teamAbbr] || []).map(([name, position]) => ({ name, position }));
+}

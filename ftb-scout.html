@@ -753,6 +753,56 @@ const ROSTER_CACHE_KEY = "ftb-rosters-v2";
 // If a cached entry has fewer than this, it's considered corrupt/incomplete.
 const MIN_ROSTER_SIZE = 8;
 
+const ROSTER_SEASON = "2025-2026";
+const ROSTER_FILE_STEMS = {
+  ATL:"AtlantaHawks", BOS:"BostonCeltics", BKN:"BrooklynNets", CHA:"CharlotteHornets", CHI:"ChicagoBulls", CLE:"ClevelandCavaliers",
+  DAL:"DallasMavericks", DEN:"DenverNuggets", DET:"DetroitPistons", GSW:"GoldenStateWarriors", HOU:"HoustonRockets", IND:"IndianaPacers",
+  LAC:"LAClippers", LAL:"LosAngelesLakers", MEM:"MemphisGrizzlies", MIA:"MiamiHeat", MIL:"MilwaukeeBucks", MIN:"MinnesotaTimberwolves",
+  NOP:"NewOrleansPelicans", NYK:"NewYorkKnicks", OKC:"OklahomaCityThunder", ORL:"OrlandoMagic", PHI:"Philadelphia76ers", PHX:"PhoenixSuns",
+  POR:"PortlandTrailBlazers", SAC:"SacramentoKings", SAS:"SanAntonioSpurs", TOR:"TorontoRaptors", UTA:"UtahJazz", WAS:"WashingtonWizards",
+};
+
+function parseRosterCsv(text, teamAbbr) {
+  const lines = text.trim().split(/?
+/);
+  if (lines.length <= 1) return [];
+  return lines.slice(1).map((line) => {
+    const cols = line.split(",");
+    const name = (cols[0] || "").trim();
+    const position = (cols[1] || "SF").trim();
+    const jersey = (cols[2] || "N/A").trim();
+    if (!name) return null;
+    const pos = normalizePosition(position.includes("/") ? position.split("/")[0] : position);
+    const usageRate = estimateUsageFromRole({}, pos);
+    return normalizeRosterPlayer({
+      name,
+      team: teamAbbr,
+      pos,
+      ppg: estimatePPG({}, usageRate),
+      usageRate,
+      gp: 40,
+      ftbPct: deriveDefaultFtbPct(usageRate, pos),
+      activeStatus: "ACTIVE",
+      source: "STATIC_CSV",
+      espnId: jersey,
+      isStarter: false,
+    });
+  }).filter(Boolean);
+}
+
+async function fetchTeamRosterFromStaticCsv(teamAbbr, cacheBypass = false) {
+  const stem = ROSTER_FILE_STEMS[teamAbbr];
+  if (!stem) throw new Error(`No static roster file mapping for ${teamAbbr}`);
+  const cacheBust = cacheBypass ? `?t=${Date.now()}` : "";
+  const endpoint = `team_rosters_2025-2026/${stem}_Roster_${ROSTER_SEASON}.csv${cacheBust}`;
+  const res = await fetch(endpoint, { cache: cacheBypass ? "no-store" : "default" });
+  if (!res.ok) throw new Error(`Static roster fetch failed (${res.status}) for ${teamAbbr} @ ${endpoint}`);
+  const text = await res.text();
+  const players = parseRosterCsv(text, teamAbbr);
+  if (players.length < MIN_ROSTER_SIZE) throw new Error(`Static roster invalid for ${teamAbbr}: ${players.length} players`);
+  return { players, endpoint, status: res.status };
+}
+
 // ─── ROSTER FRESHNESS VALIDATION ──────────────────────────────────────────────
 /**
  * Validates whether a cached roster entry is trustworthy for use.
@@ -861,25 +911,12 @@ function mergeWithFtbData(players, gp) {
  */
 function useRosters(liveGames) {
   const [players, setPlayers] = useState([]);
-  const [rosterStatus, setRosterStatus] = useState({}); // per-team status
+  const [rosterStatus, setRosterStatus] = useState({});
   const [rosterLog, setRosterLog] = useState([]);
   const [syncState, setSyncState] = useState("idle");
 
-  // Use a ref for the "sync in progress" guard — NOT a state value — so it
-  // doesn't cause stale closures or re-render loops.
-  const syncInProgress = useRef(false);
-  // Track which game-set we last synced so we can detect genuine changes
-  const lastSyncedGameKey = useRef("");
-
-  // Stable log function that doesn't change identity between renders
   const log = useCallback((msg, level = "info") => {
-    const prefix = {
-      info: "",
-      warn: "⚠️ ",
-      error: "❌ ",
-      success: "✅ ",
-      debug: "🔍 "
-    }[level] || "";
+    const prefix = { info: "", warn: "⚠️ ", error: "❌ ", success: "✅ ", debug: "🔍 " }[level] || "";
     const line = `${prefix}${msg}`;
     console.log(`[RosterSync] ${line}`);
     setRosterLog(prev => [{
@@ -887,146 +924,64 @@ function useRosters(liveGames) {
       msg: line,
       level
     }, ...prev].slice(0, 200));
-  }, []); // [] — no deps, this is truly stable
+  }, []);
 
-  // ── Core sync function ────────────────────────────────────────────────────
-  const syncRosters = useCallback(async games => {
-    if (!games || games.length === 0) {
-      log("No games scheduled — skipping roster sync", "debug");
-      return;
-    }
-
-    // Build a stable key for this game set to detect genuine re-fetches
-    const gameKey = games.map(g => `${g.away}@${g.home}`).sort().join("|");
-    if (syncInProgress.current) {
-      log(`Sync already running for: ${gameKey} — skipping duplicate trigger`, "debug");
-      return;
-    }
-    syncInProgress.current = true;
+  const syncRosters = useCallback(async (games, options = {}) => {
+    const forceBypassCache = options.forceBypassCache === true;
+    const allTeams = Object.keys(ROSTER_FILE_STEMS);
+    const teamsToday = games && games.length > 0 ? [...new Set(games.flatMap(g => [g.home, g.away]))] : allTeams;
     setSyncState("syncing");
-    const teamsToday = [...new Set(games.flatMap(g => [g.home, g.away]))];
-    log("─────────────────────────────────────────────────", "debug");
-    log(`Application startup: beginning roster synchronization`, "info");
-    log(`Today's matchups: ${games.map(g => `${g.away}@${g.home}`).join(", ")}`, "info");
-    log(`Teams to sync (${teamsToday.length}): ${teamsToday.join(", ")}`, "info");
-    log("─────────────────────────────────────────────────", "debug");
+    log(`Roster sync starting for ${teamsToday.length} teams`, "info");
 
-    // Mark all teams as "checking"
-    setRosterStatus(prev => {
-      const next = {
-        ...prev
-      };
-      teamsToday.forEach(t => {
-        next[t] = "checking";
-      });
-      return next;
-    });
-
-    // ── Step 1: Validate each team's cached roster ──────────────────────────
     const cache = loadRosterCache();
-    const needsFetch = []; // teams that require a fresh API call
-    const useCache = []; // teams whose cache is valid
+    const results = {};
+    const statuses = {};
 
     for (const team of teamsToday) {
-      log(`Checking roster for ${TEAM_NAMES[team] || team} (${team})`, "info");
-      const {
-        valid,
-        reason
-      } = validateRosterEntry(cache[team], team, true); // today's teams always invalid
+      statuses[team] = "loading";
+      setRosterStatus(prev => ({ ...prev, [team]: "loading" }));
 
-      if (!valid) {
-        log(`  Roster missing or outdated for ${team}: ${reason}`, "warn");
-        needsFetch.push(team);
-        setRosterStatus(prev => ({
-          ...prev,
-          [team]: "loading"
-        }));
-      } else {
-        log(`  Roster for ${team} is valid: ${reason}`, "debug");
-        useCache.push(team);
-        setRosterStatus(prev => ({
-          ...prev,
-          [team]: "cached"
-        }));
-      }
-    }
-    log(`─── Validation complete: ${needsFetch.length} teams need fresh data, ${useCache.length} from cache ───`, "info");
-
-    // ── Step 2: Fetch teams that need updates, 4 at a time ─────────────────
-    const CONCURRENCY = 4;
-    const results = {}; // { [teamAbbr]: player[] }
-
-    // Seed from valid cache entries immediately
-    for (const team of useCache) {
-      results[team] = cache[team].players;
-      log(`  Using cached roster for ${team} (${cache[team].players.length} players)`, "debug");
-    }
-
-    // Process needsFetch in batches
-    for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
-      const batch = needsFetch.slice(i, i + CONCURRENCY);
-      log(`Fetching batch ${Math.floor(i / CONCURRENCY) + 1}: ${batch.join(", ")}`, "info");
-      const batchResults = await Promise.allSettled(batch.map(async team => {
-        log(`  Fetching new roster from API for ${TEAM_NAMES[team] || team} (${team})...`, "info");
+      let loaded = null;
+      const attempts = forceBypassCache ? 3 : 2;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
-          const fetched = await fetchESPNRoster(team);
-          const merged = mergeWithFtbData(fetched);
-          if (merged.length < MIN_ROSTER_SIZE) {
-            throw new Error(`API returned only ${merged.length} players (expected ≥${MIN_ROSTER_SIZE})`);
-          }
-
-          // Atomic per-team cache save (no race condition)
-          saveTeamToCache(team, merged);
-          log(`  Roster update completed for ${team}: ${merged.length} players fetched`, "success");
-          setRosterStatus(prev => ({
-            ...prev,
-            [team]: "ready"
-          }));
-          return {
-            team,
-            players: merged
-          };
+          log(`Checking roster source: static CSV (${team}) attempt ${attempt}/${attempts}`, "debug");
+          const fetched = await fetchTeamRosterFromStaticCsv(team, forceBypassCache || attempt > 1);
+          loaded = fetched.players;
+          log(`Roster data retrieved successfully for ${team}: ${fetched.players.length} players (${fetched.status})`, "success");
+          break;
         } catch (e) {
-          var _stale$players;
-          log(`  API fetch failed for ${team}: ${e.message}`, "error");
-
-          // Degrade to stale cache if any exists
-          const stale = cache[team];
-          if ((stale === null || stale === void 0 || (_stale$players = stale.players) === null || _stale$players === void 0 ? void 0 : _stale$players.length) > 0) {
-            log(`  Falling back to stale cache for ${team} (${stale.players.length} players from ${new Date(stale.fetchedAt).toLocaleTimeString()})`, "warn");
-            setRosterStatus(prev => ({
-              ...prev,
-              [team]: "stale"
-            }));
-            return {
-              team,
-              players: stale.players
-            };
-          }
-          log(`  No fallback available for ${team} — roster will be empty`, "error");
-          setRosterStatus(prev => ({
-            ...prev,
-            [team]: "error"
-          }));
-          return {
+          const errObj = {
+            timestamp: new Date().toISOString(),
+            endpoint: `team_rosters_2025-2026/${ROSTER_FILE_STEMS[team]}_Roster_${ROSTER_SEASON}.csv`,
+            responseCode: 0,
             team,
-            players: []
+            attempt,
+            message: e.message,
           };
+          log(`Roster source failed ${JSON.stringify(errObj)}`, "warn");
         }
-      }));
+      }
 
-      // Collect batch results
-      for (const r of batchResults) {
-        if (r.status === "fulfilled") {
-          results[r.value.team] = r.value.players;
-        }
+      if (loaded && loaded.length >= MIN_ROSTER_SIZE) {
+        results[team] = loaded;
+        statuses[team] = "ready";
+        saveTeamToCache(team, loaded);
+        continue;
+      }
+
+      const stale = cache[team];
+      if (stale?.players?.length >= MIN_ROSTER_SIZE) {
+        log(`Using cached fallback roster for ${team} (${stale.players.length} players)`, "warn");
+        results[team] = stale.players;
+        statuses[team] = "stale";
+      } else {
+        log(`No fallback available for ${team} — roster unavailable`, "error");
+        statuses[team] = "error";
       }
     }
 
-    // ── Step 3: Assemble final player list ──────────────────────────────────
     const flat = teamsToday.flatMap(team => results[team] || []);
-
-    // Deduplicate by name+team (guards against ESPN listing a traded player on both rosters)
     const seen = new Set();
     const deduped = flat.filter(p => {
       const key = `${p.name}||${p.team}`;
@@ -1034,37 +989,22 @@ function useRosters(liveGames) {
       seen.add(key);
       return true;
     });
+
     setPlayers(deduped);
-    const errorCount = teamsToday.filter(t => rosterStatus[t] === "error").length;
-    const finalState = deduped.length === 0 ? "idle" : errorCount > 0 ? "partial" : "ready";
-    setSyncState(finalState);
-    lastSyncedGameKey.current = gameKey;
-    syncInProgress.current = false;
-    log("─────────────────────────────────────────────────", "debug");
-    log(`Roster synchronization complete: ${deduped.length} players across ${teamsToday.length} teams` + (errorCount > 0 ? ` (⚠ ${errorCount} teams had errors)` : ""), errorCount > 0 ? "warn" : "success");
-    log("─────────────────────────────────────────────────", "debug");
-  }, [log]); // log is stable ([] deps), so syncRosters is also stable
+    setRosterStatus(statuses);
+    const hasError = Object.values(statuses).includes("error");
+    setSyncState(deduped.length > 0 ? (hasError ? "partial" : "ready") : "idle");
+    log(`Roster sync complete: ${deduped.length} players loaded`, hasError ? "warn" : "success");
+  }, [log]);
 
-  // ── Startup trigger: run sync whenever liveGames arrives or changes ───────
   useEffect(() => {
-    if (liveGames.length === 0) return;
+    syncRosters(liveGames || []);
+  }, [liveGames, syncRosters]);
 
-    // Build a stable key for dedup — don't re-sync the exact same set of games
-    const gameKey = liveGames.map(g => `${g.away}@${g.home}`).sort().join("|");
-    if (gameKey === lastSyncedGameKey.current && syncState === "ready") {
-      log(`Schedule unchanged (${gameKey}) — skipping re-sync`, "debug");
-      return;
-    }
-    log(`Schedule loaded/changed — triggering startup roster sync`, "info");
-    syncRosters(liveGames);
-  }, [liveGames]); // intentionally omit syncRosters/syncState to avoid re-trigger loops
-
-  const refreshRosters = useCallback(games => {
-    // Manual refresh — reset the lastSyncedGameKey so sync always runs
-    lastSyncedGameKey.current = "";
-    syncInProgress.current = false;
-    syncRosters(games);
+  const refreshRosters = useCallback((games) => {
+    syncRosters(games || [], { forceBypassCache: true });
   }, [syncRosters]);
+
   return {
     players,
     rosterStatus,

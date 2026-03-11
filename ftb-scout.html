@@ -763,7 +763,8 @@ const ROSTER_FILE_STEMS = {
 };
 
 function parseRosterCsv(text, teamAbbr) {
-  const lines = text.trim().split(/?
+  const lines = text.trim().split(/
+?
 /);
   if (lines.length <= 1) return [];
   return lines.slice(1).map((line) => {

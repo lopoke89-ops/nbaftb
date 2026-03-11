@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { getStaticRoster } from "./static-rosters.mjs";
+import { fetchWithRetry, buildUpdateLog, loadDailyCache, saveDailyCache, buildLineupMap, DAILY_LINEUP_CACHE_KEY, DAILY_INJURY_CACHE_KEY } from "./daily-updates.mjs";
 
 // ─── REAL 2025-26 FTB DATA (jedibets.com) ────────────────────────────────────
 const SEASON_FTB_DATA = {
@@ -203,11 +205,23 @@ const ESPN_TEAM_IDS = {
 // Rosters fetched today are always considered stale at app startup for playing teams.
 // Non-playing teams use a 6-hour TTL.
 const ROSTER_TTL_MS    = 6 * 60 * 60 * 1000;
-const ROSTER_CACHE_KEY = "ftb-rosters-v2";
+const ROSTER_CACHE_KEY = "ftb-rosters-v3";
 
 // Minimum expected roster size. ESPN returns 15-20 active + 2-way + two-ways.
 // If a cached entry has fewer than this, it's considered corrupt/incomplete.
 const MIN_ROSTER_SIZE = 8;
+
+const BALLDONTLIE_TEAM_IDS = {
+  ATL:1, BOS:2, BKN:3, CHA:4, CHI:5, CLE:6, DAL:7, DEN:8, DET:9, GSW:10,
+  HOU:11, IND:12, LAC:13, LAL:14, MEM:15, MIA:16, MIL:17, MIN:18, NOP:19, NYK:20,
+  OKC:21, ORL:22, PHI:23, PHX:24, POR:25, SAC:26, SAS:27, TOR:28, UTA:29, WAS:30,
+};
+
+const BREF_TEAM_CODES = {
+  ATL:"ATL", BOS:"BOS", BKN:"BRK", CHA:"CHO", CHI:"CHI", CLE:"CLE", DAL:"DAL", DEN:"DEN", DET:"DET", GSW:"GSW",
+  HOU:"HOU", IND:"IND", LAC:"LAC", LAL:"LAL", MEM:"MEM", MIA:"MIA", MIL:"MIL", MIN:"MIN", NOP:"NOP", NYK:"NYK",
+  OKC:"OKC", ORL:"ORL", PHI:"PHI", PHX:"PHO", POR:"POR", SAC:"SAC", SAS:"SAS", TOR:"TOR", UTA:"UTA", WAS:"WAS",
+};
 
 // ─── ROSTER FRESHNESS VALIDATION ──────────────────────────────────────────────
 /**
@@ -261,6 +275,54 @@ function saveTeamToCache(teamAbbr, players) {
   }
 }
 
+function normalizeHeightWeight(height, weight) {
+  let hw = "";
+  if (height) hw += String(height).trim();
+  if (weight) hw += `${hw ? " / " : ""}${String(weight).trim()}`;
+  return hw;
+}
+
+function normalizeStarterFlag(rawStarter, rawStatus) {
+  if (typeof rawStarter === "boolean") return rawStarter;
+  const s = String(rawStarter || "").toLowerCase();
+  const status = String(rawStatus || "").toLowerCase();
+  if (["starter", "starting"].includes(s) || status.includes("starter")) return true;
+  if (["bench", "reserve"].includes(s) || status.includes("bench")) return false;
+  return null;
+}
+
+function normalizeRosterPlayer({
+  name,
+  team,
+  pos,
+  ppg = 0,
+  usageRate = 0,
+  gp = 0,
+  ftbPct = 0,
+  espnId = "",
+  isStarter = null,
+  heightWeight = "",
+  activeStatus = "ACTIVE",
+  source = "unknown",
+}) {
+  return {
+    name,
+    team,
+    opp: "",
+    gameTime: "",
+    pos: normalizePosition(pos),
+    ppg: parseFloat((ppg || 0).toFixed ? ppg.toFixed(1) : Number(ppg || 0).toFixed(1)),
+    usageRate: parseFloat((usageRate || 0).toFixed ? usageRate.toFixed(1) : Number(usageRate || 0).toFixed(1)),
+    gp: Math.max(0, Math.round(Number(gp) || 0)),
+    ftbPct: Math.max(0, Math.round(Number(ftbPct) || 0)),
+    espnId: String(espnId || ""),
+    isStarter,
+    heightWeight,
+    activeStatus,
+    rosterSource: source,
+  };
+}
+
 // ─── MERGE ESPN ROSTER WITH KNOWN FTB DATA ─────────────────────────────────────
 function mergeWithFtbData(players, gp) {
   return players.map(p => {
@@ -292,190 +354,60 @@ function mergeWithFtbData(players, gp) {
  */
 function useRosters(liveGames) {
   const [players, setPlayers]           = useState([]);
-  const [rosterStatus, setRosterStatus] = useState({});  // per-team status
+  const [rosterStatus, setRosterStatus] = useState({});
   const [rosterLog, setRosterLog]       = useState([]);
   const [syncState, setSyncState]       = useState("idle");
 
-  // Use a ref for the "sync in progress" guard — NOT a state value — so it
-  // doesn't cause stale closures or re-render loops.
-  const syncInProgress = useRef(false);
-  // Track which game-set we last synced so we can detect genuine changes
-  const lastSyncedGameKey = useRef("");
-
-  // Stable log function that doesn't change identity between renders
   const log = useCallback((msg, level = "info") => {
     const prefix = { info:"", warn:"⚠️ ", error:"❌ ", success:"✅ ", debug:"🔍 " }[level] || "";
     const line = `${prefix}${msg}`;
     console.log(`[RosterSync] ${line}`);
     setRosterLog(prev => [{ time: new Date().toLocaleTimeString(), msg: line, level }, ...prev].slice(0, 200));
-  }, []); // [] — no deps, this is truly stable
+  }, []);
 
-  // ── Core sync function ────────────────────────────────────────────────────
   const syncRosters = useCallback(async (games) => {
-    if (!games || games.length === 0) {
-      log("No games scheduled — skipping roster sync", "debug");
-      return;
-    }
+    if (!games || games.length === 0) return;
 
-    // Build a stable key for this game set to detect genuine re-fetches
-    const gameKey = games.map(g => `${g.away}@${g.home}`).sort().join("|");
-    if (syncInProgress.current) {
-      log(`Sync already running for: ${gameKey} — skipping duplicate trigger`, "debug");
-      return;
-    }
-
-    syncInProgress.current = true;
     setSyncState("syncing");
-
     const teamsToday = [...new Set(games.flatMap(g => [g.home, g.away]))];
+    const nextStatus = {};
+    const nextPlayers = [];
 
-    log("─────────────────────────────────────────────────", "debug");
-    log(`Application startup: beginning roster synchronization`, "info");
-    log(`Today's matchups: ${games.map(g => `${g.away}@${g.home}`).join(", ")}`, "info");
-    log(`Teams to sync (${teamsToday.length}): ${teamsToday.join(", ")}`, "info");
-    log("─────────────────────────────────────────────────", "debug");
-
-    // Mark all teams as "checking"
-    setRosterStatus(prev => {
-      const next = { ...prev };
-      teamsToday.forEach(t => { next[t] = "checking"; });
-      return next;
-    });
-
-    // ── Step 1: Validate each team's cached roster ──────────────────────────
-    const cache = loadRosterCache();
-    const needsFetch = [];   // teams that require a fresh API call
-    const useCache   = [];   // teams whose cache is valid
+    log(`Loading static rosters for ${teamsToday.length} teams`, "info");
 
     for (const team of teamsToday) {
-      log(`Checking roster for ${TEAM_NAMES[team] || team} (${team})`, "info");
-
-      const { valid, reason } = validateRosterEntry(cache[team], team, true); // today's teams always invalid
-
-      if (!valid) {
-        log(`  Roster missing or outdated for ${team}: ${reason}`, "warn");
-        needsFetch.push(team);
-        setRosterStatus(prev => ({ ...prev, [team]: "loading" }));
-      } else {
-        log(`  Roster for ${team} is valid: ${reason}`, "debug");
-        useCache.push(team);
-        setRosterStatus(prev => ({ ...prev, [team]: "cached" }));
+      const roster = getStaticRoster(team);
+      if (roster.length === 0) {
+        log(`Static roster missing for ${team}`, "error");
+        nextStatus[team] = "error";
+        continue;
       }
+
+      nextPlayers.push(...roster.map((p) => normalizeRosterPlayer({
+        name: p.name,
+        team,
+        pos: p.position,
+        ppg: estimatePPG({}, estimateUsageFromRole({}, normalizePosition(p.position))),
+        usageRate: estimateUsageFromRole({}, normalizePosition(p.position)),
+        gp: 40,
+        ftbPct: deriveDefaultFtbPct(estimateUsageFromRole({}, normalizePosition(p.position)), normalizePosition(p.position)),
+        source: "STATIC",
+      })));
+      nextStatus[team] = "ready";
+      log(`Loaded static roster for ${team} (${roster.length} players)`, "debug");
     }
 
-    log(`─── Validation complete: ${needsFetch.length} teams need fresh data, ${useCache.length} from cache ───`, "info");
+    setPlayers(nextPlayers);
+    setRosterStatus(nextStatus);
+    setSyncState(Object.values(nextStatus).some(v => v === "error") ? "partial" : "ready");
+    log("Static roster load complete", "success");
+  }, [log]);
 
-    // ── Step 2: Fetch teams that need updates, 4 at a time ─────────────────
-    const CONCURRENCY = 4;
-    const results = {}; // { [teamAbbr]: player[] }
-
-    // Seed from valid cache entries immediately
-    for (const team of useCache) {
-      results[team] = cache[team].players;
-      log(`  Using cached roster for ${team} (${cache[team].players.length} players)`, "debug");
-    }
-
-    // Process needsFetch in batches
-    for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
-      const batch = needsFetch.slice(i, i + CONCURRENCY);
-      log(`Fetching batch ${Math.floor(i/CONCURRENCY)+1}: ${batch.join(", ")}`, "info");
-
-      const batchResults = await Promise.allSettled(
-        batch.map(async (team) => {
-          log(`  Fetching new roster from API for ${TEAM_NAMES[team] || team} (${team})...`, "info");
-          try {
-            const fetched = await fetchESPNRoster(team);
-            const merged  = mergeWithFtbData(fetched);
-
-            if (merged.length < MIN_ROSTER_SIZE) {
-              throw new Error(`API returned only ${merged.length} players (expected ≥${MIN_ROSTER_SIZE})`);
-            }
-
-            // Atomic per-team cache save (no race condition)
-            saveTeamToCache(team, merged);
-
-            log(`  Roster update completed for ${team}: ${merged.length} players fetched`, "success");
-            setRosterStatus(prev => ({ ...prev, [team]: "ready" }));
-            return { team, players: merged };
-
-          } catch(e) {
-            log(`  API fetch failed for ${team}: ${e.message}`, "error");
-
-            // Degrade to stale cache if any exists
-            const stale = cache[team];
-            if (stale?.players?.length > 0) {
-              log(`  Falling back to stale cache for ${team} (${stale.players.length} players from ${new Date(stale.fetchedAt).toLocaleTimeString()})`, "warn");
-              setRosterStatus(prev => ({ ...prev, [team]: "stale" }));
-              return { team, players: stale.players };
-            }
-
-            log(`  No fallback available for ${team} — roster will be empty`, "error");
-            setRosterStatus(prev => ({ ...prev, [team]: "error" }));
-            return { team, players: [] };
-          }
-        })
-      );
-
-      // Collect batch results
-      for (const r of batchResults) {
-        if (r.status === "fulfilled") {
-          results[r.value.team] = r.value.players;
-        }
-      }
-    }
-
-    // ── Step 3: Assemble final player list ──────────────────────────────────
-    const flat = teamsToday.flatMap(team => results[team] || []);
-
-    // Deduplicate by name+team (guards against ESPN listing a traded player on both rosters)
-    const seen = new Set();
-    const deduped = flat.filter(p => {
-      const key = `${p.name}||${p.team}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    setPlayers(deduped);
-
-    const errorCount = teamsToday.filter(t => rosterStatus[t] === "error").length;
-    const finalState = deduped.length === 0 ? "idle" : errorCount > 0 ? "partial" : "ready";
-    setSyncState(finalState);
-    lastSyncedGameKey.current = gameKey;
-    syncInProgress.current = false;
-
-    log("─────────────────────────────────────────────────", "debug");
-    log(
-      `Roster synchronization complete: ${deduped.length} players across ${teamsToday.length} teams` +
-      (errorCount > 0 ? ` (⚠ ${errorCount} teams had errors)` : ""),
-      errorCount > 0 ? "warn" : "success"
-    );
-    log("─────────────────────────────────────────────────", "debug");
-
-  }, [log]); // log is stable ([] deps), so syncRosters is also stable
-
-  // ── Startup trigger: run sync whenever liveGames arrives or changes ───────
   useEffect(() => {
-    if (liveGames.length === 0) return;
+    if (liveGames.length > 0) syncRosters(liveGames);
+  }, [liveGames, syncRosters]);
 
-    // Build a stable key for dedup — don't re-sync the exact same set of games
-    const gameKey = liveGames.map(g => `${g.away}@${g.home}`).sort().join("|");
-    if (gameKey === lastSyncedGameKey.current && syncState === "ready") {
-      log(`Schedule unchanged (${gameKey}) — skipping re-sync`, "debug");
-      return;
-    }
-
-    log(`Schedule loaded/changed — triggering startup roster sync`, "info");
-    syncRosters(liveGames);
-
-  }, [liveGames]); // intentionally omit syncRosters/syncState to avoid re-trigger loops
-
-  const refreshRosters = useCallback((games) => {
-    // Manual refresh — reset the lastSyncedGameKey so sync always runs
-    lastSyncedGameKey.current = "";
-    syncInProgress.current = false;
-    syncRosters(games);
-  }, [syncRosters]);
+  const refreshRosters = useCallback((games) => syncRosters(games), [syncRosters]);
 
   return { players, rosterStatus, rosterLog, syncState, refreshRosters };
 }
@@ -519,8 +451,7 @@ function normalizePosition(raw) {
 // ─── ESPN ROSTER FETCHER ───────────────────────────────────────────────────────
 /**
  * Fetches the current roster for `teamAbbr` from ESPN.
- * Returns an array of player objects matching the internal schema:
- * { name, team, pos, ppg, usageRate, gp, ftbPct, espnId, isStarter }
+ * Returns normalized player objects matching the internal schema.
  */
 async function fetchESPNRoster(teamAbbr) {
   const teamId = ESPN_TEAM_IDS[teamAbbr];
@@ -534,7 +465,6 @@ async function fetchESPNRoster(teamAbbr) {
   const athletes = data?.athletes || [];
   const players = [];
 
-  // ESPN returns athletes grouped by position category
   for (const group of athletes) {
     const items = group?.items || group?.athletes || (Array.isArray(group) ? group : []);
     for (const athlete of items) {
@@ -544,9 +474,8 @@ async function fetchESPNRoster(teamAbbr) {
       const rawPos = athlete?.position?.abbreviation || athlete?.position?.displayName || "";
       const pos = normalizePosition(rawPos);
 
-      // Pull stats from athlete.statistics if present, else use defaults
       const stats = athlete?.statistics?.splits?.categories || [];
-      let ppg = 0, gp = 0, usageRate = 0, ftbPct = 0;
+      let ppg = 0, gp = 0, usageRate = 0;
 
       for (const cat of stats) {
         for (const stat of cat?.stats || []) {
@@ -558,32 +487,145 @@ async function fetchESPNRoster(teamAbbr) {
         }
       }
 
-      // Estimate ftbPct from usage + position if we don't have real data
       if (usageRate === 0) usageRate = estimateUsageFromRole(athlete, pos);
       if (ppg === 0)       ppg       = estimatePPG(athlete, usageRate);
-      if (gp === 0)        gp        = 40; // safe mid-season default
+      if (gp === 0)        gp        = 40;
 
-      // ftbPct: use known data if available, else derive from usage
       const knownFtb = SEASON_FTB_DATA[name];
-      ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
 
-      players.push({
+      players.push(normalizeRosterPlayer({
         name,
         team: teamAbbr,
-        opp: "",         // filled in at enrichment time
-        gameTime: "",    // filled in at enrichment time
         pos,
-        ppg: parseFloat(ppg.toFixed(1)),
-        usageRate: parseFloat(usageRate.toFixed(1)),
+        ppg,
+        usageRate,
         gp,
         ftbPct,
         espnId: String(athlete?.id || ""),
-        isStarter: athlete?.starter === true,
-      });
+        isStarter: normalizeStarterFlag(athlete?.starter, athlete?.status?.type?.description),
+        heightWeight: normalizeHeightWeight(athlete?.displayHeight, athlete?.displayWeight ? `${athlete.displayWeight} lb` : ""),
+        activeStatus: athlete?.status?.type?.description || "ACTIVE",
+        source: "ESPN",
+      }));
     }
   }
 
-  return players;
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
+}
+
+async function fetchBallDontLieRoster(teamAbbr) {
+  const teamId = BALLDONTLIE_TEAM_IDS[teamAbbr];
+  if (!teamId) throw new Error(`No balldontlie team ID for ${teamAbbr}`);
+
+  const url = `https://www.balldontlie.io/api/v1/players?per_page=100&team_ids[]=${teamId}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`balldontlie roster ${teamAbbr}: HTTP ${res.status}`);
+  const data = await res.json();
+  const rows = data?.data || [];
+
+  const players = rows
+    .map((player) => {
+      const name = `${player?.first_name || ""} ${player?.last_name || ""}`.trim();
+      if (!name) return null;
+      const pos = normalizePosition(player?.position || "SF");
+      const usageRate = estimateUsageFromRole({}, pos);
+      const ppg = estimatePPG({}, usageRate);
+      const gp = 40;
+      const knownFtb = SEASON_FTB_DATA[name];
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+
+      return normalizeRosterPlayer({
+        name,
+        team: teamAbbr,
+        pos,
+        ppg,
+        usageRate,
+        gp,
+        ftbPct,
+        espnId: String(player?.id || ""),
+        isStarter: null,
+        heightWeight: normalizeHeightWeight(player?.height_feet && player?.height_inches ? `${player.height_feet}'${player.height_inches}"` : "", player?.weight_pounds ? `${player.weight_pounds} lb` : ""),
+        activeStatus: "ACTIVE",
+        source: "balldontlie",
+      });
+    })
+    .filter(Boolean);
+
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
+}
+
+async function fetchBasketballReferenceRoster(teamAbbr) {
+  const brefCode = BREF_TEAM_CODES[teamAbbr];
+  if (!brefCode) throw new Error(`No Basketball Reference code for ${teamAbbr}`);
+
+  const year = new Date().getFullYear() + 1;
+  const url = `https://www.basketball-reference.com/teams/${brefCode}/${year}.html`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Basketball Reference roster ${teamAbbr}: HTTP ${res.status}`);
+  const html = await res.text();
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+  const rows = [...doc.querySelectorAll("table#roster tbody tr")];
+
+  const players = rows
+    .map((row) => {
+      const name = row.querySelector("td[data-stat='player']")?.textContent?.trim();
+      if (!name) return null;
+      const rawPos = row.querySelector("td[data-stat='pos']")?.textContent?.trim() || "SF";
+      const pos = normalizePosition(rawPos);
+      const usageRate = estimateUsageFromRole({}, pos);
+      const ppg = estimatePPG({}, usageRate);
+      const gp = 40;
+      const knownFtb = SEASON_FTB_DATA[name];
+      const ftbPct = knownFtb ? Math.round((knownFtb.ftbMade / Math.max(gp, 1)) * 100) : deriveDefaultFtbPct(usageRate, pos);
+      const height = row.querySelector("td[data-stat='height']")?.textContent?.trim() || "";
+      const weight = row.querySelector("td[data-stat='weight']")?.textContent?.trim();
+
+      return normalizeRosterPlayer({
+        name,
+        team: teamAbbr,
+        pos,
+        ppg,
+        usageRate,
+        gp,
+        ftbPct,
+        isStarter: null,
+        heightWeight: normalizeHeightWeight(height, weight ? `${weight} lb` : ""),
+        activeStatus: "ACTIVE",
+        source: "BasketballReference",
+      });
+    })
+    .filter(Boolean);
+
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
+}
+
+async function fetchRosterWithFallback(teamAbbr, log) {
+  log(`Static roster mode enabled; external full-roster fetch disabled for ${teamAbbr}`, "debug");
+  return getStaticRoster(teamAbbr).map((p) => normalizeRosterPlayer({
+    name: p.name,
+    team: teamAbbr,
+    pos: p.position,
+    ppg: estimatePPG({}, estimateUsageFromRole({}, normalizePosition(p.position))),
+    usageRate: estimateUsageFromRole({}, normalizePosition(p.position)),
+    gp: 40,
+    ftbPct: deriveDefaultFtbPct(estimateUsageFromRole({}, normalizePosition(p.position)), normalizePosition(p.position)),
+    source: "STATIC",
+  }));
 }
 
 /** Estimate usage rate from ESPN athlete jersey/role hints when stats are missing */
@@ -763,6 +805,7 @@ export default function FTBScout() {
   const [injuryData, setInjuryData] = useState(KNOWN_INJURIES_TODAY);
   const [injuryLoading, setInjuryLoading] = useState(true);
   const [injurySource, setInjurySource] = useState("cached");
+  const [lineupData, setLineupData] = useState({});
   const [pbpData, setPbpData] = useState({});
   const [oddsKey, setOddsKey] = useState("");
   const [savedKey, setSavedKey] = useState(null);
@@ -1022,13 +1065,28 @@ export default function FTBScout() {
   // Use real data if available, else fallback
   const TEAM_POSITION_FTB = positionData || FALLBACK_POSITION_FTB;
 
-  // Merge ESPN + known injuries
+  // Fetch injuries once daily with cache + retry
   const fetchInjuries = useCallback(async () => {
     setInjuryLoading(true);
     try {
-      // Use ESPN's free public injury API
-      const res = await fetch("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries");
-      const data = await res.json();
+      const cached = loadDailyCache(localStorage, DAILY_INJURY_CACHE_KEY);
+      if (cached?.injuries) {
+        setInjuryData(cached.injuries);
+        setInjurySource("daily-cache");
+        setInjuryLoading(false);
+        return;
+      }
+
+      const endpoint = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries";
+      const data = await fetchWithRetry(async (attempt) => {
+        const res = await fetch(endpoint);
+        if (!res.ok) {
+          console.error("[DailyUpdate]", buildUpdateLog({ endpoint, statusCode: res.status, message: `HTTP ${res.status}`, teamAbbr: "NBA", updateType: "injury", attempt }));
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+      }, { retries: 2, baseDelayMs: 400 });
+
       const fresh = {};
       if (data?.injuries) {
         data.injuries.forEach(team => {
@@ -1045,6 +1103,7 @@ export default function FTBScout() {
       const merged = { ...KNOWN_INJURIES_TODAY, ...fresh };
       setInjuryData(merged);
       setInjurySource(Object.keys(fresh).length > 0 ? "espn-live" : "cached");
+      saveDailyCache(localStorage, DAILY_INJURY_CACHE_KEY, { injuries: merged });
     } catch(e) {
       console.error('Failed to fetch injuries:', e);
       setInjurySource("cached");
@@ -1053,7 +1112,57 @@ export default function FTBScout() {
     }
   }, []);
 
+  const fetchDailyLineups = useCallback(async () => {
+    const cached = loadDailyCache(localStorage, DAILY_LINEUP_CACHE_KEY);
+    if (cached?.lineups) {
+      setLineupData(cached.lineups);
+      return;
+    }
+
+    const teamsToday = [...new Set(liveGames.flatMap(g => [g.home, g.away]))];
+    if (teamsToday.length === 0) return;
+
+    const updates = {};
+    for (const team of teamsToday) {
+      const teamId = ESPN_TEAM_IDS[team];
+      const endpoint = `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${teamId}/roster`;
+      try {
+        const rosterJson = await fetchWithRetry(async (attempt) => {
+          const res = await fetch(endpoint);
+          if (!res.ok) {
+            console.error("[DailyUpdate]", buildUpdateLog({ endpoint, statusCode: res.status, message: `HTTP ${res.status}`, teamAbbr: team, updateType: "lineup", attempt }));
+            throw new Error(`HTTP ${res.status}`);
+          }
+          return res.json();
+        }, { retries: 2, baseDelayMs: 300 });
+
+        const starters = [];
+        const groups = rosterJson?.athletes || [];
+        groups.forEach(group => {
+          const items = group?.items || [];
+          items.forEach(a => {
+            if (a?.starter === true && a?.displayName) starters.push(a.displayName);
+          });
+        });
+
+        if (starters.length === 0) {
+          updates[team] = getStaticRoster(team).slice(0, 5).map(p => p.name);
+        } else {
+          updates[team] = starters.slice(0, 5);
+        }
+      } catch (e) {
+        console.error("[DailyUpdate]", buildUpdateLog({ endpoint, statusCode: 0, message: e.message, teamAbbr: team, updateType: "lineup", attempt: 1 }));
+      }
+    }
+
+    const staticByTeam = Object.fromEntries(teamsToday.map(t => [t, getStaticRoster(t)]));
+    const validated = buildLineupMap(updates, staticByTeam, (msg) => console.warn("[DailyUpdate]", msg));
+    setLineupData(validated);
+    saveDailyCache(localStorage, DAILY_LINEUP_CACHE_KEY, { lineups: validated });
+  }, [liveGames]);
+
   useEffect(() => { fetchInjuries(); }, [fetchInjuries]);
+  useEffect(() => { fetchDailyLineups(); }, [fetchDailyLineups]);
 
   // Build the set of teams playing today from the live schedule
   const todayTeams = new Set(liveGames.flatMap(g => [g.home, g.away]));
@@ -1070,8 +1179,10 @@ export default function FTBScout() {
       const ftb    = SEASON_FTB_DATA[p.name];
       const injury = injuryData[p.name] || null;
       const score  = computeScore({ ...p, opp: liveOpp }, ftb, injury?.status, TEAM_POSITION_FTB);
+      const lineupNames = lineupData[p.team] || [];
+      const isStarter = lineupNames.includes(p.name);
 
-      return { ...p, opp: liveOpp, gameTime: liveTime, ftb, injury, score };
+      return { ...p, opp: liveOpp, gameTime: liveTime, ftb, injury, score, isStarter };
     });
 
   const filtered = selectedGame
@@ -1158,7 +1269,7 @@ export default function FTBScout() {
                   </div>
                 )}
                 <div style={{ fontSize:8,color:"#334155",letterSpacing:.5 }}>
-                  via {injurySource === "espn-live" ? "ESPN Live" : "Confirmed Reports"}
+                  via {injurySource === "espn-live" ? "ESPN Live" : injurySource === "daily-cache" ? "Daily Cache" : "Confirmed Reports"}
                 </div>
                 <button className="btn" onClick={fetchInjuries} style={{ background:"#111827",border:"1px solid #1e2d4a",color:"#64748b",borderRadius:6,padding:"3px 8px",fontSize:9 }}>↻</button>
               </div>
@@ -1322,6 +1433,7 @@ export default function FTBScout() {
                           <span style={{ fontSize:9,color:"#334155" }}>vs {player.opp} · {player.pos} · {player.gameTime}</span>
                           {player.ftb && !isOut && <span style={{ fontSize:9,color:"#FFD700",fontWeight:700 }}>🏀×{player.ftb.ftbMade}</span>}
                         </div>
+                        {player.isStarter && <div style={{ fontSize:9,color:"#4ADE80",fontWeight:800,marginTop:3 }}>★ STARTER</div>}
                         {player.injury && <InjuryBadge status={player.injury.status} reason={player.injury.reason}/>}
                         {player.ftb && !isOut && <ShotBar shots={player.ftb.shots}/>}
                       </div>

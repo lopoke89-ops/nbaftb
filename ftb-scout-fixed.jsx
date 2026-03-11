@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { fetchAndValidateRoster, atomicUpdateRosterCache } from "./roster-fetch.mjs";
 
 // ─── REAL 2025-26 FTB DATA (jedibets.com) ────────────────────────────────────
 const SEASON_FTB_DATA = {
@@ -266,8 +267,8 @@ function loadRosterCache() {
 function saveTeamToCache(teamAbbr, players) {
   try {
     const cache = loadRosterCache();
-    cache[teamAbbr] = { players, fetchedAt: Date.now() };
-    localStorage.setItem(ROSTER_CACHE_KEY, JSON.stringify(cache));
+    const updated = atomicUpdateRosterCache(cache, teamAbbr, players, Date.now());
+    localStorage.setItem(ROSTER_CACHE_KEY, JSON.stringify(updated));
   } catch(e) {
     console.warn(`[RosterSync] Failed to cache ${teamAbbr}:`, e.message);
   }
@@ -355,6 +356,11 @@ function useRosters(liveGames) {
   const [rosterStatus, setRosterStatus] = useState({});  // per-team status
   const [rosterLog, setRosterLog]       = useState([]);
   const [syncState, setSyncState]       = useState("idle");
+  const playersRef = useRef([]);
+
+  useEffect(() => {
+    playersRef.current = players;
+  }, [players]);
 
   // Use a ref for the "sync in progress" guard — NOT a state value — so it
   // doesn't cause stale closures or re-render loops.
@@ -388,6 +394,13 @@ function useRosters(liveGames) {
     setSyncState("syncing");
 
     const teamsToday = [...new Set(games.flatMap(g => [g.home, g.away]))];
+    const previousByTeam = {};
+    for (const p of playersRef.current) {
+      if (teamsToday.includes(p.team)) {
+        if (!previousByTeam[p.team]) previousByTeam[p.team] = [];
+        previousByTeam[p.team].push(p);
+      }
+    }
 
     log("─────────────────────────────────────────────────", "debug");
     log(`Application startup: beginning roster synchronization`, "info");
@@ -469,16 +482,22 @@ function useRosters(liveGames) {
               return { team, players: stale.players };
             }
 
-            log(`  No fallback available for ${team} — roster will be empty`, "error");
+            if (previousByTeam[team]?.length > 0) {
+              log(`  Keeping last in-memory roster for ${team} (${previousByTeam[team].length} players) to avoid data loss`, "warn");
+              setRosterStatus(prev => ({ ...prev, [team]: "stale" }));
+              return { team, players: previousByTeam[team] };
+            }
+
+            log(`  No fallback available for ${team} — preserving existing state and skipping update`, "error");
             setRosterStatus(prev => ({ ...prev, [team]: "error" }));
-            return { team, players: [] };
+            return null;
           }
         })
       );
 
       // Collect batch results
       for (const r of batchResults) {
-        if (r.status === "fulfilled") {
+        if (r.status === "fulfilled" && r.value?.team) {
           results[r.value.team] = r.value.players;
         }
       }
@@ -639,7 +658,11 @@ async function fetchESPNRoster(teamAbbr) {
     }
   }
 
-  return players;
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
 }
 
 async function fetchBallDontLieRoster(teamAbbr) {
@@ -652,7 +675,7 @@ async function fetchBallDontLieRoster(teamAbbr) {
   const data = await res.json();
   const rows = data?.data || [];
 
-  return rows
+  const players = rows
     .map((player) => {
       const name = `${player?.first_name || ""} ${player?.last_name || ""}`.trim();
       if (!name) return null;
@@ -679,6 +702,12 @@ async function fetchBallDontLieRoster(teamAbbr) {
       });
     })
     .filter(Boolean);
+
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
 }
 
 async function fetchBasketballReferenceRoster(teamAbbr) {
@@ -695,7 +724,7 @@ async function fetchBasketballReferenceRoster(teamAbbr) {
   const doc = parser.parseFromString(html, "text/html");
   const rows = [...doc.querySelectorAll("table#roster tbody tr")];
 
-  return rows
+  const players = rows
     .map((row) => {
       const name = row.querySelector("td[data-stat='player']")?.textContent?.trim();
       if (!name) return null;
@@ -724,6 +753,12 @@ async function fetchBasketballReferenceRoster(teamAbbr) {
       });
     })
     .filter(Boolean);
+
+  return {
+    players,
+    statusCode: res.status,
+    endpoint: url,
+  };
 }
 
 async function fetchRosterWithFallback(teamAbbr, log) {
@@ -740,23 +775,40 @@ async function fetchRosterWithFallback(teamAbbr, log) {
   });
 
   const sources = [
-    { name: "Primary API (ESPN)", fetcher: fetchESPNRoster },
-    { name: "Alternative API (balldontlie)", fetcher: fetchBallDontLieRoster },
-    { name: "Alternative website (Basketball Reference)", fetcher: fetchBasketballReferenceRoster },
+    {
+      name: "Primary API (ESPN)",
+      endpoint: "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/:teamId/roster",
+      fetch: fetchESPNRoster,
+    },
+    {
+      name: "Alternative API (balldontlie)",
+      endpoint: "https://www.balldontlie.io/api/v1/players",
+      fetch: fetchBallDontLieRoster,
+    },
+    {
+      name: "Alternative website (Basketball Reference)",
+      endpoint: "https://www.basketball-reference.com/teams/:team/:year.html",
+      fetch: fetchBasketballReferenceRoster,
+    },
   ];
 
-  for (const src of sources) {
-    log(`Checking roster source: ${src.name}`, "debug");
+  for (const source of sources) {
+    log(`Checking roster source: ${source.name}`, "debug");
     try {
-      const players = await src.fetcher(teamAbbr);
-      if (!Array.isArray(players) || players.length === 0) {
-        log(`${src.name} returned no roster data`, "warn");
-        continue;
-      }
-      log(`Roster data retrieved successfully from ${src.name} (${players.length} players)`, "success");
-      return players;
+      const validated = await fetchAndValidateRoster({
+        teamAbbr,
+        source,
+        log,
+        retryConfig: { retries: 2, baseDelayMs: 350, timeoutMs: 8000 },
+      });
+
+      log(
+        `Roster data retrieved successfully from ${source.name} (${validated.players.length} players)`,
+        "success"
+      );
+      return validated.players;
     } catch (e) {
-      log(`${src.name} failed for ${teamAbbr}: ${e.message}`, "warn");
+      log(`${source.name} failed for ${teamAbbr}: ${e.message}`, "warn");
     }
   }
 
